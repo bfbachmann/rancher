@@ -42,21 +42,27 @@ func (h *handler) OnMgmtClusterRemove(_ string, cluster *v3.Cluster) (*v3.Cluste
 }
 
 func (h *handler) OnClusterRemove(_ string, cluster *v1.Cluster) (*v1.Cluster, error) {
-	oldStatus := cluster.Status
-	cluster = cluster.DeepCopy()
+	status := cluster.Status
+	clusterCopy := cluster.DeepCopy()
 
-	err := capr.DoRemoveAndUpdateStatus(cluster, h.doClusterRemove(cluster), h.clusters.EnqueueAfter)
+	err := capr.DoRemoveAndUpdateStatus(cluster, h.doClusterRemove(clusterCopy), h.clusters.EnqueueAfter)
 
-	if equality.Semantic.DeepEqual(oldStatus, cluster.Status) {
-		return cluster, err
+	if equality.Semantic.DeepEqual(status, clusterCopy.Status) {
+		if err != nil {
+			return clusterCopy, fmt.Errorf(
+				"error removing cluster (cluster status unchanged since last error): %w",
+				err,
+			)
+		}
+		return clusterCopy, nil
 	}
 
 	cluster, updateErr := h.clusters.UpdateStatus(cluster)
 	if updateErr != nil {
-		return cluster, updateErr
+		return cluster, fmt.Errorf("error updating cluster status: %w", updateErr)
 	}
 
-	return cluster, err
+	return cluster, fmt.Errorf("error removing cluster: %w", err)
 }
 
 func (h *handler) doClusterRemove(cluster *v1.Cluster) func() (string, error) {
@@ -66,7 +72,7 @@ func (h *handler) doClusterRemove(cluster *v1.Cluster) func() (string, error) {
 			if err != nil {
 				// We do nothing if the management cluster does not exist (IsNotFound) because it's been deleted.
 				if !apierrors.IsNotFound(err) {
-					return "", err
+					return "", fmt.Errorf("error getting cluster %s: %w", cluster.Status.ClusterName, err)
 				}
 			} else if cluster.Namespace == mgmtCluster.Spec.FleetWorkspaceName {
 				// We only delete the management cluster if its FleetWorkspaceName matches the provisioning cluster's
@@ -75,7 +81,7 @@ func (h *handler) doClusterRemove(cluster *v1.Cluster) func() (string, error) {
 				// FleetWorkspace. Ultimately, the aforementioned cluster objects are re-created in another namespace.
 				err := h.mgmtClusters.Delete(cluster.Status.ClusterName, nil)
 				if err != nil && !apierrors.IsNotFound(err) {
-					return "", err
+					return "", fmt.Errorf("error deleting cluster %s: %w", cluster.Status.ClusterName, err)
 				}
 
 				if h.isLegacyCluster(cluster) {
@@ -94,20 +100,20 @@ func (h *handler) doClusterRemove(cluster *v1.Cluster) func() (string, error) {
 
 		capiCluster, capiClusterErr := h.capiClustersCache.Get(cluster.Namespace, cluster.Name)
 		if capiClusterErr != nil && !apierrors.IsNotFound(capiClusterErr) {
-			return "", capiClusterErr
+			return "", fmt.Errorf("error getting CAPI cluster: %w", capiClusterErr)
 		}
 
 		if capiCluster != nil {
 			if capiCluster.DeletionTimestamp == nil {
 				// Deleting the CAPI cluster will start the process of deleting Machines, Bootstraps, etc.
 				if err := h.capiClusters.Delete(capiCluster.Namespace, capiCluster.Name, &metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-					return "", err
+					return "", fmt.Errorf("error deleting CAPI cluster: %w", err)
 				}
 			}
 
 			_, err := h.rkeControlPlanesCache.Get(cluster.Namespace, cluster.Name)
 			if err != nil && !apierrors.IsNotFound(err) {
-				return "", err
+				return "", fmt.Errorf("error getting RKE controlplane: %w", err)
 			} else if err == nil {
 				return "", generic.ErrSkip
 			}
@@ -115,7 +121,7 @@ func (h *handler) doClusterRemove(cluster *v1.Cluster) func() (string, error) {
 
 		machines, err := h.capiMachinesCache.List(cluster.Namespace, labels.SelectorFromSet(labels.Set{capi.ClusterNameLabel: cluster.Name}))
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("error listing CAPI machines: %w", err)
 		}
 
 		// Machines will delete first so report their status, if any exist.
